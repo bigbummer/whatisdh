@@ -1,0 +1,30 @@
+[
+  {
+    "workbook": "научно-производственный совет.xlsx",
+    "sheets": [
+      {
+        "sheet": "члены научно-производственного ",
+        "rows": 47,
+        "cols": 10,
+        "promoted_header": false,
+        "dropped_empty_rows": 0,
+        "dropped_empty_cols": 0
+      }
+    ],
+    "output_json": "/mnt/data/научно-производственный совет__all_sheets.json"
+  },
+  {
+    "workbook": "Научные руководители 2025_26.xlsx",
+    "sheets": [
+      {
+        "sheet": "Sheet1",
+        "rows": 11,
+        "cols": 6,
+        "promoted_header": false,
+        "dropped_empty_rows": 0,
+        "dropped_empty_cols": 0
+      }
+    ],
+    "output_json": "/mnt/data/Научные руководители 2025_26__all_sheets.json"
+  }
+]

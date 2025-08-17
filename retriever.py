@@ -1,8 +1,8 @@
 import os
 import io
 import json
+import glob
 import hashlib
-import time
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
 
@@ -13,7 +13,7 @@ from pypdf import PdfReader
 from openai import OpenAI
 import config as C
 
-# Гарантируем наличие директорий хранения
+# Директории для данных и индекса
 os.makedirs(C.DATA_DIR, exist_ok=True)
 os.makedirs(C.STORAGE_DIR, exist_ok=True)
 
@@ -26,6 +26,9 @@ class Doc:
     section: str
 
 
+# ---------------------------
+# OpenAI helpers
+# ---------------------------
 def _openai_client() -> OpenAI:
     if not C.OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY in environment")
@@ -52,6 +55,9 @@ def normalize(v: np.ndarray) -> np.ndarray:
     return v / norms
 
 
+# ---------------------------
+# FAISS store (robust search)
+# ---------------------------
 class FaissStore:
     def __init__(self, d: int):
         self.d = d
@@ -64,15 +70,13 @@ class FaissStore:
         self.index.add(vecs)
         self.meta.extend(metas)
 
-    def search(self, q: np.ndarray, k: int=None) -> List[Tuple[float, Dict[str, Any]]]:
+    def search(self, q: np.ndarray, k: int = None) -> List[Tuple[float, Dict[str, Any]]]:
         if self.index.ntotal == 0:
             return []
         k = int(k or C.RETRIEVAL_K)
-        # ограничим k, чтобы не запрашивать больше, чем есть
         k = max(1, min(k, max(1, self.index.ntotal)))
         D, I = self.index.search(q, k)
 
-        # Приведём формы к ожидаемым (1, k)
         D = np.asarray(D)
         I = np.asarray(I)
         if D.ndim == 1:
@@ -81,19 +85,15 @@ class FaissStore:
             I = I.reshape(1, -1)
 
         out: List[Tuple[float, Dict[str, Any]]] = []
-        # Безопасно итерируем по первой строке
+        # Берём первую строку результатов
         for score, idx in zip(D[0].tolist(), I.tolist()):
-            # idx может прийти как numpy тип — приведём к int
             try:
                 idx_int = int(idx)
             except Exception:
-                # если FAISS вернул что-то неожиданное — пропускаем
                 continue
             if idx_int < 0:
-                # -1 означает пустой слот
                 continue
             if idx_int >= len(self.meta):
-                # защита от несоответствия размеров
                 continue
             out.append((float(score), self.meta[idx_int]))
         return out
@@ -115,30 +115,25 @@ class FaissStore:
         return store
 
 
-
-# Google Drive utilities
-
+# ---------------------------
+# Google Drive loaders (public/private)
+# ---------------------------
 def _list_and_download_public_folder(folder_url: str, out_dir: str) -> List[str]:
     """
     Публичная папка: пытаемся скачать через gdown.
-    Если упрёмся в лимит (более 50 файлов) или другую ошибку — не падаем,
-    просто работаем с тем, что уже успели скачать/что есть локально.
+    Любые ошибки не валят процесс — работаем с тем, что есть локально.
     """
     if not folder_url:
         return []
-    import gdown
+    print(f"[Drive public] Fetch: {folder_url} -> {out_dir}")
     os.makedirs(out_dir, exist_ok=True)
-
     try:
-        # gdown имеет лимит ~50 файлов на папку, при превышении кидает FolderContentsMaximumLimitError
+        import gdown
         gdown.download_folder(url=folder_url, output=out_dir, quiet=True, use_cookies=False)
     except Exception as e:
-        # Не прерываем выполнение: переходим к использованию локально уже имеющихся PDF
-        # При желании можно добавить логирование:
-        # print(f"[warn] gdown error on public folder: {e}. Proceeding with local PDFs in {out_dir}")
-        pass
+        print(f"[Drive public][WARN] Failed: {e}")
+        print("Проверьте формат ссылки (/drive/folders/<ID>) и права (Anyone with the link: Viewer).")
 
-    # Собираем локальные PDF, даже если загрузка прервалась
     pdfs: List[str] = []
     for root, _, files in os.walk(out_dir):
         for f in files:
@@ -148,57 +143,90 @@ def _list_and_download_public_folder(folder_url: str, out_dir: str) -> List[str]
 
 
 def _list_and_download_private_folder(folder_id: str, out_dir: str, service_json: str) -> List[str]:
-    """
-    Приватная папка: скачиваем через Google Drive API (Service Account).
-    """
+    print(f"[Drive private] List: {folder_id} -> {out_dir} (key exists: {os.path.exists(service_json)})")
     if not folder_id or not os.path.exists(service_json):
+        print("[Drive private][WARN] Missing folder_id or service account key; skipping.")
         return []
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
 
-    SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-    creds = service_account.Credentials.from_service_account_file(service_json, scopes=SCOPES)
-    drive = build("drive", "v3", credentials=creds)
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+    except Exception as e:
+        print(f"[Drive private][WARN] Google API libs import failed: {e}")
+        return []
+
+    try:
+        SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+        creds = service_account.Credentials.from_service_account_file(service_json, scopes=SCOPES)
+        drive = build("drive", "v3", credentials=creds)
+    except Exception as e:
+        print(f"[Drive private][WARN] Failed to init Drive client: {e}")
+        return []
 
     os.makedirs(out_dir, exist_ok=True)
     pdf_paths: List[str] = []
     page_token = None
     query = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
-    while True:
-        resp = drive.files().list(
-            q=query,
-            fields="files(id, name, modifiedTime), nextPageToken",
-            pageToken=page_token
-        ).execute()
-        files = resp.get("files", [])
-        for f in files:
-            file_id = f["id"]
-            name = f["name"]
-            local_path = os.path.join(out_dir, name)
-            if not os.path.exists(local_path):
-                request = drive.files().get_media(fileId=file_id)
-                fh = io.FileIO(local_path, "wb")
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-            pdf_paths.append(local_path)
-        page_token = resp.get("nextPageToken", None)
-        if page_token is None:
-            break
+    try:
+        while True:
+            resp = drive.files().list(
+                q=query,
+                fields="files(id, name, modifiedTime), nextPageToken",
+                pageToken=page_token
+            ).execute()
+            files = resp.get("files", [])
+            for f in files:
+                file_id = f["id"]
+                name = f["name"]
+                local_path = os.path.join(out_dir, name)
+                try:
+                    if not os.path.exists(local_path):
+                        request = drive.files().get_media(fileId=file_id)
+                        fh = io.FileIO(local_path, "wb")
+                        downloader = MediaIoBaseDownload(fh, request)
+                        done = False
+                        while not done:
+                            _, done = downloader.next_chunk()
+                    pdf_paths.append(local_path)
+                except Exception as e_file:
+                    print(f"[Drive private][WARN] Skip file '{name}' ({file_id}): {e_file}")
+                    try:
+                        if os.path.exists(local_path):
+                            os.remove(local_path)
+                    except Exception:
+                        pass
+                    continue
+            page_token = resp.get("nextPageToken", None)
+            if page_token is None:
+                break
+    except Exception as e:
+        print(f"[Drive private][WARN] Listing/downloading failed: {e}")
+        return []
+
     return sorted(list(set(pdf_paths)))
 
 
+# ---------------------------
+# PDF parsing
+# ---------------------------
 def extract_pdf_text(path: str) -> str:
     try:
         reader = PdfReader(path)
         parts = []
         for page in reader.pages:
-            text = page.extract_text() or ""
+            try:
+                text = page.extract_text() or ""
+            except Exception as e_page:
+                print(f"[PDF][WARN] Failed page in '{path}': {e_page}")
+                text = ""
             parts.append(text)
-        return "\n".join(parts)
-    except Exception:
+        text = "\n".join(parts).strip()
+        if not text:
+            print(f"[PDF][WARN] Empty text: {path}")
+        return text
+    except Exception as e:
+        print(f"[PDF][WARN] Failed to read '{path}': {e}")
         return ""
 
 
@@ -216,17 +244,169 @@ def infer_section_from_filename(fname: str) -> str:
 def chunk_text(text: str, source: str, section: str, chunk_chars: int, overlap: int) -> List[Doc]:
     text = " ".join(text.split())
     docs: List[Doc] = []
+    if not text:
+        return docs
     i = 0
+    step = max(1, chunk_chars - overlap)
     while i < len(text):
         chunk = text[i:i+chunk_chars]
         if not chunk.strip():
             break
         doc_id = hashlib.md5((source + str(i)).encode()).hexdigest()[:16]
         docs.append(Doc(id=doc_id, text=chunk, source=os.path.basename(source), section=section))
-        i += max(1, chunk_chars - overlap)
+        i += step
     return docs
 
 
+# ---------------------------
+# JSON ingestion (supervisors + council)
+# ---------------------------
+def _safe_read_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[JSON][WARN] Failed to read {path}: {e}")
+        return None
+
+
+def _docs_from_supervisors_json(data: dict) -> List[Doc]:
+    """
+    Поддерживает форматы:
+    - vkr_json_export_all.json:
+      { "nauchnye_rukovoditeli_2025_26": { "Sheet1": [ {...}, ... ] }, ... }
+    - Nauchnye_rukovoditeli_2025_26__all_sheets.json:
+      { "Sheet1": [ {...}, ... ] }
+    """
+    docs: List[Doc] = []
+    sheet = None
+    if isinstance(data, dict):
+        if "nauchnye_rukovoditeli_2025_26" in data and isinstance(data["nauchnye_rukovoditeli_2025_26"], dict):
+            inner = data["nauchnye_rukovoditeli_2025_26"]
+            sheet = inner.get("Sheet1")
+        elif "Sheet1" in data:
+            sheet = data.get("Sheet1")
+
+    if not sheet or not isinstance(sheet, list):
+        return docs
+
+    for row in sheet:
+        try:
+            fio = (row.get("ФИО") or "").strip()
+            if not fio:
+                continue
+            interests = (row.get("Мои интересы:") or "").strip()
+            format_vkr = (row.get("Формат ВКР: проект/исследование") or "").strip()
+            helpful = (row.get("Чем я могу быть полезен как научный руководитель:") or "").strip()
+            ideas = (row.get("Готовые идеи или темы, над которыми я хочу работать вместе с вами:") or "").strip()
+            about = (row.get("Хочу рассказать о себе ещё кое-что важное:") or "").strip()
+
+            text = (
+                f"Научный руководитель: {fio}\n"
+                f"Интересы: {interests}\n"
+                f"Формат ВКР: {format_vkr}\n"
+                f"Чем полезен: {helpful}\n"
+                f"Темы/идеи: {ideas}\n"
+                f"Пояснение: {about}\n"
+            )
+            doc_id = hashlib.md5((fio + interests + format_vkr).encode()).hexdigest()[:16]
+            docs.append(Doc(id=doc_id, text=text, source="supervisors_json", section="Faculty"))
+        except Exception as e:
+            print(f"[JSON][WARN] Skip supervisor row: {e}")
+            continue
+    return docs
+
+
+def _docs_from_nps_json(data: dict) -> List[Doc]:
+    """
+    Научно-производственный совет:
+    - vkr_json_export_all.json: { "nauchno_proizvodstvenny_sovet": { "члены научно-производственного ": [ {...}, ... ] } }
+    - nauchno-proizvodstvennyi_sovet__all_sheets.json: { "члены научно-производственного ": [ {...}, ... ] }
+    """
+    docs: List[Doc] = []
+    entries = None
+    if isinstance(data, dict):
+        if "nauchno_proizvodstvenny_sovet" in data and isinstance(data["nauchno_proizvodstvenny_sovet"], dict):
+            block = data["nauchno_proizvodstvenny_sovet"]
+            entries = block.get("члены научно-производственного ") or block.get("члены научно-производственного")
+        elif "члены научно-производственного " in data:
+            entries = data["члены научно-производственного "]
+        elif "члены научно-производственного" in data:
+            entries = data["члены научно-производственного"]
+
+    if not entries or not isinstance(entries, list):
+        return docs
+
+    for row in entries:
+        try:
+            name = (row.get("Фамилия Имя") or "").strip()
+            if not name:
+                continue
+            tema = (row.get("Тема") or "").strip()
+            inst = (row.get("Институция") or "").strip()
+            fac = (row.get("Факультет/кафедра/лаборатория") or "").strip()
+            tg = (row.get("Телеграм") or "").strip()
+            email = (row.get("Email для коммуникаций") or row.get("Email для доступов") or "").strip()
+            city = (row.get("Город") or "").strip()
+            group = (row.get("Группа") or "").strip()
+            titr = (row.get("Титр") or "").strip()
+
+            text = (
+                f"Эксперт/руководитель: {name}\n"
+                f"Статус/титр: {titr}\n"
+                f"Институция: {inst}\n"
+                f"Подразделение: {fac}\n"
+                f"Темы/области: {tema}\n"
+                f"Контакты: Telegram={tg} Email={email}\n"
+                f"Город/группа: {city} / {group}\n"
+            )
+            doc_id = hashlib.md5((name + inst + tema).encode()).hexdigest()[:16]
+            docs.append(Doc(id=doc_id, text=text, source="nps_json", section="Faculty"))
+        except Exception as e:
+            print(f"[JSON][WARN] Skip NPS row: {e}")
+            continue
+
+    return docs
+
+
+def _collect_json_docs() -> List[Doc]:
+    """
+    Ищем JSON в data_json/: vkr_json_export_all.json и любые *_all_sheets.json
+    """
+    docs: List[Doc] = []
+    json_dir = "data_json"
+    if not os.path.isdir(json_dir):
+        return docs
+
+    # Слитый файл, если есть
+    merged_path = os.path.join(json_dir, "vkr_json_export_all.json")
+    if os.path.exists(merged_path):
+        data = _safe_read_json(merged_path)
+        if data:
+            docs += _docs_from_supervisors_json(data)
+            docs += _docs_from_nps_json(data)
+
+    # Отдельные файлы-экспорты
+    for path in glob.glob(os.path.join(json_dir, "*__all_sheets.json")):
+        data = _safe_read_json(path)
+        if not data:
+            continue
+        before = len(docs)
+        docs += _docs_from_supervisors_json(data)
+        docs += _docs_from_nps_json(data)
+        if len(docs) == before:
+            print(f"[JSON][INFO] Unknown schema in {os.path.basename(path)} — skipped")
+
+    if docs:
+        print(f"[JSON][OK] Collected {len(docs)} docs from JSON tables.")
+    else:
+        print("[JSON][INFO] No JSON docs found or parsed.")
+    return docs
+
+
+# ---------------------------
+# Build/download pipeline
+# ---------------------------
 def download_pdfs_from_drive() -> List[str]:
     pdf_paths: List[str] = []
     if C.DRIVE_MODE == "public":
@@ -239,64 +419,93 @@ def download_pdfs_from_drive() -> List[str]:
         pdf_paths += _list_and_download_private_folder(
             C.DRIVE_FOLDER_ID_2, os.path.join(C.DATA_DIR, "folder2"), C.GOOGLE_SERVICE_ACCOUNT_JSON
         )
+    # фильтруем реально существующие
+    pdf_paths = [p for p in sorted(set(pdf_paths)) if os.path.exists(p)]
+    if not pdf_paths:
+        print("[Drive][WARN] No PDFs found. Proceeding with JSON only (if any).")
     return pdf_paths
 
 
 def build_index_from_pdfs(pdfs: List[str]) -> FaissStore:
     docs: List[Doc] = []
+
+    # PDF -> chunks
     for pdf in pdfs:
         txt = extract_pdf_text(pdf)
+        if not txt:
+            print(f"[RAG][INFO] Skip empty/extraction-failed PDF: {pdf}")
+            continue
         section = infer_section_from_filename(os.path.basename(pdf))
         docs += chunk_text(txt, source=pdf, section=section, chunk_chars=C.CHUNK_CHARS, overlap=C.CHUNK_OVERLAP)
 
+    # JSON -> faculty docs
+    docs += _collect_json_docs()
+
     if not docs:
-        placeholder = "Корпус пуст. Добавьте PDF в указанные папки Google Drive и перезапустите."
+        placeholder = "Корпус пуст или недоступен. Добавьте PDF/JSON и перезапустите."
         docs = [Doc(id="placeholder", text=placeholder, source="placeholder", section="Notice")]
 
     texts = [d.text for d in docs]
     embs = normalize(embed_texts(texts))
     if embs.size == 0:
-        # fallback размерности — text-embedding-3-large = 3,072
+        # fallback на размерность text-embedding-3-large
         embs = np.zeros((1, 3072), dtype="float32")
+        docs = [Doc(id="placeholder2", text="(Нет данных для индекса)", source="placeholder", section="Notice")]
+
     store = FaissStore(d=embs.shape[1])
     metas = [{"id": d.id, "text": d.text, "source": d.source, "section": d.section} for d in docs]
     store.add(embs, metas)
     store.save()
+    print(f"[RAG][OK] Index built. Docs: {len(metas)}")
     return store
 
 
 def load_or_rebuild_index() -> FaissStore:
-    # Текущая "сигнатура" локального кэша PDF: размер и mtime
+    # Локальная подпись PDF-кэша
     current: Dict[str, Dict[str, Any]] = {}
     for root, _, files in os.walk(C.DATA_DIR):
         for f in files:
             if f.lower().endswith(".pdf"):
                 path = os.path.join(root, f)
-                stat = os.stat(path)
-                current[path] = {"size": stat.st_size, "mtime": int(stat.st_mtime)}
+                try:
+                    stat = os.stat(path)
+                    current[path] = {"size": stat.st_size, "mtime": int(stat.st_mtime)}
+                except Exception:
+                    continue
+
     prev: Dict[str, Dict[str, Any]] = {}
     if os.path.exists(C.PDF_CACHE):
-        with open(C.PDF_CACHE, "r", encoding="utf-8") as fp:
-            prev = json.load(fp)
+        try:
+            with open(C.PDF_CACHE, "r", encoding="utf-8") as fp:
+                prev = json.load(fp)
+        except Exception:
+            prev = {}
     unchanged = (current == prev)
 
     if os.path.exists(C.INDEX_PATH) and os.path.exists(C.META_PATH) and unchanged:
         store = FaissStore.load()
         if store:
+            print("[RAG] Using cached FAISS index.")
             return store
 
-    # Иначе — пробуем скачать (с обработкой лимита в публичном режиме) и пересобираем
     pdfs = download_pdfs_from_drive()
     store = build_index_from_pdfs(pdfs)
-    with open(C.PDF_CACHE, "w", encoding="utf-8") as fp:
-        json.dump(current, fp, ensure_ascii=False, indent=2)
+    try:
+        with open(C.PDF_CACHE, "w", encoding="utf-8") as fp:
+            json.dump(current, fp, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[RAG][WARN] Failed to write PDF cache: {e}")
     return store
 
 
 def retrieve(store: FaissStore, query: str, k: int = None) -> List[Dict[str, Any]]:
     oai = _openai_client()
-    emb = oai.embeddings.create(model=C.EMBED_MODEL, input=[query])
-    q = normalize(np.array([emb.data[0].embedding], dtype="float32"))
+    try:
+        emb = oai.embeddings.create(model=C.EMBED_MODEL, input=[query])
+        q = normalize(np.array([emb.data[0].embedding], dtype="float32"))
+    except Exception as e:
+        print(f"[RAG][WARN] Embedding failed: {e}")
+        return []
     k = k or C.RETRIEVAL_K
     results = store.search(q, k=k)
     ctxs: List[Dict[str, Any]] = []
