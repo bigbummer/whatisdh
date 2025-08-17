@@ -1,0 +1,55 @@
+# Секреты и конфиги
+.env
+.env.*
+!/.env.example
+
+# Локальные ключи и учетные данные
+service_account.json
+
+# Кеши и артефакты Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Виртуальные окружения
+venv/
+.envrc
+.venv/
+env/
+.conda/
+pip-wheel-metadata/
+
+# Кеши инструментов
+.pytest_cache/
+.mypy_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE/редакторы
+.vscode/
+.idea/
+*.iml
+
+# Операционные системы
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# Данные приложения (локальные артефакты)
+storage/
+data_pdfs/
+
+# Если нужен индекс в репозитории — убери storage/ и явно включи пример:
+# !storage/.gitkeep
+# !data_pdfs/.gitkeep

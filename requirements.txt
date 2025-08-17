@@ -1,0 +1,12 @@
+aiogram==3.4.1
+openai==1.35.7
+faiss-cpu==1.8.0.post1
+python-dotenv==1.0.1
+tiktoken==0.7.0
+pypdf==4.2.0
+# Для public папок по ссылке:
+gdown==5.2.0
+# Для private (через сервисный аккаунт):
+google-api-python-client==2.141.0
+google-auth==2.33.0
+google-auth-oauthlib==1.2.1
